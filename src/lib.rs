@@ -5,20 +5,26 @@
 //! Or you can use [`trace_child`] to start tracing an [`std::process::Child`].
 //! You can also trace an arbitrary process using [`trace_pid`].
 
+#![warn(missing_docs)]
 #![allow(clippy::field_reassign_with_default)]
 
+mod error;
+mod util;
+
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::mem::size_of;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
+use std::ptr::{addr_of, addr_of_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use object::Object;
+use pdb_addr2line::pdb::PDB;
+use pdb_addr2line::ContextPdbData;
 use windows::core::{GUID, PCSTR, PSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND, HANDLE,
-    INVALID_HANDLE_VALUE, WIN32_ERROR,
-};
-use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_PRIVILEGES,
-};
-use windows::Win32::System::Diagnostics::Debug::{
-    FormatMessageA, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+    CloseHandle, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceA, OpenTraceA, ProcessTrace, StartTraceA, SystemTraceControlGuid,
@@ -30,24 +36,22 @@ use windows::Win32::System::Diagnostics::Etw::{
     WNODE_FLAG_TRACED_GUID,
 };
 use windows::Win32::System::SystemInformation::{GetVersionExA, OSVERSIONINFOA};
-use windows::Win32::System::SystemServices::SE_SYSTEM_PROFILE_NAME;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, SetThreadPriority,
-    WaitForSingleObject, CREATE_SUSPENDED, PROCESS_ALL_ACCESS, THREAD_PRIORITY_TIME_CRITICAL,
+    GetCurrentThread, SetThreadPriority, CREATE_SUSPENDED, THREAD_PRIORITY_TIME_CRITICAL,
 };
 
-use pdb_addr2line::{pdb::PDB, ContextPdbData};
+use crate::error::get_last_error;
+pub use crate::error::{Error, Result};
 
-use std::ffi::OsString;
-use std::io::{Read, Write};
-use std::mem::size_of;
-use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
-use std::ptr::{addr_of, addr_of_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+/// Maximum stack depth/height of traces.
+// msdn says 192 but I got some that were bigger
+// const MAX_STACK_DEPTH: usize = 192;
+const MAX_STACK_DEPTH: usize = 200;
 
 /// map[array_of_stacktrace_addrs] = sample_count
 type StackMap = rustc_hash::FxHashMap<[u64; MAX_STACK_DEPTH], u64>;
+
+/// Stateful context provided to `event_record_callback`.
 struct TraceContext {
     target_process_handle: HANDLE,
     stack_counts_hashmap: StackMap,
@@ -60,9 +64,11 @@ struct TraceContext {
 }
 impl TraceContext {
     /// The Context takes ownership of the handle.
-    /// SAFETY:
-    ///  - target_process_handle must be a valid process handle.
-    ///  - target_proc_id must be the id of the process.
+    ///
+    /// # Safety
+    ///
+    /// - `target_process_handle` must be a valid process handle.
+    /// - `target_proc_id` must be the id of the same process as the handle.
     unsafe fn new(
         target_process_handle: HANDLE,
         target_proc_pid: u32,
@@ -94,110 +100,12 @@ impl Drop for TraceContext {
         }
     }
 }
-// msdn says 192 but I got some that were bigger
-//const MAX_STACK_DEPTH: usize = 192;
-const MAX_STACK_DEPTH: usize = 200;
 
-#[derive(Debug)]
-pub enum Error {
-    /// Blondie requires administrator privileges
-    NotAnAdmin,
-    /// Error writing to the provided Writer
-    Write(std::io::Error),
-    /// Error spawning a suspended process
-    SpawnErr(std::io::Error),
-    /// Error waiting for child, abandoned
-    WaitOnChildErrAbandoned,
-    /// Error waiting for child, timed out
-    WaitOnChildErrTimeout,
-    /// A call to a windows API function returned an error and we didn't know how to handle it
-    Other(WIN32_ERROR, String, &'static str),
-    /// We require Windows 7 or greater
-    UnsupportedOsVersion,
-    /// This should never happen
-    UnknownError,
-}
-type Result<T> = std::result::Result<T, Error>;
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::Write(err)
-    }
-}
-
-fn get_last_error(extra: &'static str) -> Error {
-    const BUF_LEN: usize = 1024;
-    let mut buf = [0u8; BUF_LEN];
-    let code = unsafe { GetLastError() };
-    let chars_written = unsafe {
-        FormatMessageA(
-            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            None,
-            code.0,
-            0,
-            PSTR(buf.as_mut_ptr()),
-            BUF_LEN as u32,
-            None,
-        )
-    };
-    assert!(chars_written != 0);
-    let code_str = unsafe {
-        std::ffi::CStr::from_ptr(buf.as_ptr().cast())
-            .to_str()
-            .unwrap_or("Invalid utf8 in error")
-    };
-    Error::Other(code, code_str.to_string(), extra)
-}
-
-/// A wrapper around `OpenProcess` that returns a handle with all access rights
-unsafe fn handle_from_process_id(process_id: u32) -> Result<HANDLE> {
-    match OpenProcess(PROCESS_ALL_ACCESS, false, process_id) {
-        Ok(handle) => Ok(handle),
-        Err(_) => Err(get_last_error("handle_from_process_id")),
-    }
-}
-
-unsafe fn wait_for_process_by_handle(handle: HANDLE) -> Result<()> {
-    let ret = WaitForSingleObject(handle, 0xFFFFFFFF);
-    match ret.0 {
-        0 => Ok(()),
-        0x00000080 => Err(Error::WaitOnChildErrAbandoned),
-        0x00000102 => Err(Error::WaitOnChildErrTimeout),
-        _ => Err(get_last_error("wait_for_process_by_handle")),
-    }
-}
-
-fn acquire_privileges() -> Result<()> {
-    let mut privs = TOKEN_PRIVILEGES::default();
-    privs.PrivilegeCount = 1;
-    privs.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if unsafe {
-        LookupPrivilegeValueW(None, SE_SYSTEM_PROFILE_NAME, &mut privs.Privileges[0].Luid).0 == 0
-    } {
-        return Err(get_last_error("acquire_privileges LookupPrivilegeValueA"));
-    }
-    let mut pt = HANDLE::default();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut pt).0 == 0 } {
-        return Err(get_last_error("OpenProcessToken"));
-    }
-    let adjust = unsafe { AdjustTokenPrivileges(pt, false, Some(addr_of!(privs)), 0, None, None) };
-    if adjust.0 == 0 {
-        let err = Err(get_last_error("AdjustTokenPrivileges"));
-        unsafe {
-            CloseHandle(pt);
-        }
-        return err;
-    }
-    let ret = unsafe { CloseHandle(pt) };
-    if ret.0 == 0 {
-        return Err(get_last_error("acquire_privileges CloseHandle"));
-    }
-    let status = unsafe { GetLastError() };
-    if status != ERROR_SUCCESS {
-        return Err(Error::NotAnAdmin);
-    }
-    Ok(())
-}
-/// SAFETY: is_suspended must only be true if `target_process` is suspended
+/// The main tracing logic. Traces the process with the given `target_process_id`.
+///
+/// # Safety
+///
+/// `is_suspended` may only be true if `target_process` is suspended
 unsafe fn trace_from_process_id(
     target_process_id: u32,
     is_suspended: bool,
@@ -207,7 +115,7 @@ unsafe fn trace_from_process_id(
     winver_info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOA>() as u32;
     let ret = GetVersionExA(&mut winver_info);
     if ret.0 == 0 {
-        return Err(get_last_error("TraceSetInformation interval"));
+        return Err(get_last_error("GetVersionExA"));
     }
     // If we're not win7 or more, return unsupported
     // https://docs.microsoft.com/en-us/windows/win32/sysinfo/operating-system-version
@@ -216,7 +124,7 @@ unsafe fn trace_from_process_id(
     {
         return Err(Error::UnsupportedOsVersion);
     }
-    acquire_privileges()?;
+    util::acquire_privileges()?;
 
     // Set the sampling interval
     // Only for Win8 or more
@@ -238,12 +146,8 @@ unsafe fn trace_from_process_id(
         }
     }
 
-    let mut kernel_logger_name_with_nul = KERNEL_LOGGER_NAMEA
-        .as_bytes()
-        .iter()
-        .cloned()
-        .chain(Some(0))
-        .collect::<Vec<u8>>();
+    let mut kernel_logger_name_with_nul = KERNEL_LOGGER_NAMEA.as_bytes().to_vec();
+    kernel_logger_name_with_nul.push(b'\0');
     // Build the trace properties, we want EVENT_TRACE_FLAG_PROFILE for the "SampledProfile" event
     // https://docs.microsoft.com/en-us/windows/win32/etw/sampledprofile
     // In https://docs.microsoft.com/en-us/windows/win32/etw/event-tracing-mof-classes that event is listed as a "kernel event"
@@ -345,9 +249,9 @@ unsafe fn trace_from_process_id(
         }
     }
 
-    let target_proc_handle = handle_from_process_id(target_process_id)?;
+    let target_proc_handle = util::handle_from_process_id(target_process_id)?;
     let mut context = TraceContext::new(target_proc_handle, target_process_id, kernel_stacks)?;
-    //TODO: Do we need to Box the context?
+    // TODO: Do we need to Box the context?
 
     let mut log = EVENT_TRACE_LOGFILEA::default();
     log.LoggerName = PSTR(kernel_logger_name_with_nul.as_mut_ptr());
@@ -487,17 +391,16 @@ unsafe fn trace_from_process_id(
         return Err(get_last_error("OpenTraceA processing"));
     }
 
-    let (sender, recvr) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // This blocks
+    let processing_thread = std::thread::spawn(move || {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        // This blocks
         ProcessTrace(&[trace_processing_handle], None, None);
 
         let ret = CloseTrace(trace_processing_handle);
         if ret != ERROR_SUCCESS {
-            panic!("Error closing trace");
+            return Err(get_last_error("Error closing trace"));
         }
-        sender.send(()).unwrap();
+        Ok(())
     });
 
     // Wait until we know for sure the trace is running
@@ -526,7 +429,7 @@ unsafe fn trace_from_process_id(
     }
 
     // Wait for it to end
-    wait_for_process_by_handle(target_proc_handle)?;
+    util::wait_for_process_by_handle(target_proc_handle)?;
     // This unblocks ProcessTrace
     let ret = ControlTraceA(
         <CONTROLTRACE_HANDLE as Default>::default(),
@@ -537,14 +440,15 @@ unsafe fn trace_from_process_id(
     if ret != ERROR_SUCCESS {
         return Err(get_last_error("ControlTraceA STOP ProcessTrace"));
     }
+
     // Block until processing thread is done
     // (Safeguard to make sure we don't deallocate the context before the other thread finishes using it)
-    if recvr.recv().is_err() {
-        return Err(Error::UnknownError);
-    }
+    processing_thread
+        .join()
+        .map_err(|_err_any| Error::UnknownError)??;
 
     if context.show_kernel_samples {
-        let kernel_module_paths = list_kernel_modules();
+        let kernel_module_paths = util::list_kernel_modules();
         context.image_paths.extend(kernel_module_paths);
     }
 
@@ -724,7 +628,7 @@ impl<'a> CallStack<'a> {
     ///
     /// This also performs symbol resolution if possible, and tries to find the image (DLL/EXE) it comes from
     fn iter_resolved_addresses<
-        F: for<'b> FnMut(u64, u64, &'b [&'b str], Option<&'b str>) -> Result<()>,
+        F: for<'b> FnMut(u64, u64, &'b [&'b str], Option<&'b str>) -> std::io::Result<()>,
     >(
         &'a self,
         pdb_db: &'a PdbDb,
@@ -750,7 +654,7 @@ impl<'a> CallStack<'a> {
             let module = pdb_db.range(..addr).next_back();
             let module = match module {
                 None => {
-                    f(addr, 0, &[], None)?;
+                    (f)(addr, 0, &[], None).map_err(Error::Write)?;
                     symbol_names_storage = reuse_vec(symbol_names);
                     continue;
                 }
@@ -762,7 +666,7 @@ impl<'a> CallStack<'a> {
             let procedure_frames = match module.3.find_frames(addr_in_module as u32) {
                 Ok(Some(x)) => x,
                 _ => {
-                    f(addr, 0, &[], image_name)?;
+                    (f)(addr, 0, &[], image_name).map_err(Error::Write)?;
                     symbol_names_storage = reuse_vec(symbol_names);
                     continue;
                 }
@@ -770,7 +674,7 @@ impl<'a> CallStack<'a> {
             for frame in &procedure_frames.frames {
                 symbol_names.push(frame.function.as_deref().unwrap_or("Unknown"));
             }
-            f(addr, displacement, &symbol_names, image_name)?;
+            (f)(addr, displacement, &symbol_names, image_name).map_err(Error::Write)?;
             symbol_names_storage = reuse_vec(symbol_names);
         }
         *v = symbol_names_storage;
@@ -837,7 +741,7 @@ impl CollectionResults {
 
             if !empty_callstack {
                 let count = callstack.sample_count;
-                write!(w, "\t\t{count}\n\n")?;
+                write!(w, "\t\t{count}\n\n").map_err(Error::Write)?;
             }
         }
         Ok(())
@@ -860,80 +764,4 @@ struct ImageLoadEvent {
     Reserved2: u32,
     Reserved3: u32,
     Reserved4: u32,
-}
-
-/// Returns a sequence of (image_file_path, image_base)
-fn list_kernel_modules() -> Vec<(OsString, u64, u64)> {
-    // kernel module enumeration code based on http://www.rohitab.com/discuss/topic/40696-list-loaded-drivers-with-ntquerysysteminformation/
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtQuerySystemInformation(
-            SystemInformationClass: u32,
-            SystemInformation: *mut (),
-            SystemInformationLength: u32,
-            ReturnLength: *mut u32,
-        ) -> i32;
-    }
-
-    const BUF_LEN: usize = 1024 * 1024;
-    let mut out_buf = vec![0u8; BUF_LEN];
-    let mut out_size = 0u32;
-    // 11 = SystemModuleInformation
-    let retcode = unsafe {
-        NtQuerySystemInformation(
-            11,
-            out_buf.as_mut_ptr().cast(),
-            BUF_LEN as u32,
-            &mut out_size,
-        )
-    };
-    if retcode < 0 {
-        //println!("Failed to load kernel modules");
-        return vec![];
-    }
-    let number_of_modules = unsafe { out_buf.as_ptr().cast::<u32>().read_unaligned() as usize };
-    #[repr(C)]
-    #[derive(Debug)]
-    #[allow(non_snake_case)]
-    #[allow(non_camel_case_types)]
-    struct _RTL_PROCESS_MODULE_INFORMATION {
-        Section: *mut std::ffi::c_void,
-        MappedBase: *mut std::ffi::c_void,
-        ImageBase: *mut std::ffi::c_void,
-        ImageSize: u32,
-        Flags: u32,
-        LoadOrderIndex: u16,
-        InitOrderIndex: u16,
-        LoadCount: u16,
-        OffsetToFileName: u16,
-        FullPathName: [u8; 256],
-    }
-    let modules = unsafe {
-        let modules_ptr = out_buf
-            .as_ptr()
-            .cast::<u32>()
-            .offset(2)
-            .cast::<_RTL_PROCESS_MODULE_INFORMATION>();
-        std::slice::from_raw_parts(modules_ptr, number_of_modules)
-    };
-
-    let kernel_module_paths = modules
-        .iter()
-        .filter_map(|module| {
-            unsafe { std::ffi::CStr::from_ptr(module.FullPathName.as_ptr().cast()) }
-                .to_str()
-                .ok()
-                .map(|mod_str_filepath| {
-                    let verbatim_path_osstring: OsString = mod_str_filepath
-                        .replacen("\\SystemRoot\\", "\\\\?\\C:\\Windows\\", 1)
-                        .into();
-                    (
-                        verbatim_path_osstring,
-                        module.ImageBase as u64,
-                        module.ImageSize as u64,
-                    )
-                })
-        })
-        .collect();
-    kernel_module_paths
 }
